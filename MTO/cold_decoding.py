@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os
+import nltk_compat  # noqa: F401  (offline fallbacks for NLTK data; must precede other nltk imports)
 import numpy as np
 import time
 import wandb
@@ -79,10 +80,21 @@ def options():
     parser.add_argument("--seed", type=int, default=-1)
     parser.add_argument("--no-cuda", action="store_true", help="no cuda")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--run_tag", type=str, default="", help="suffix for the results jsonl name, to keep runs apart")
+    parser.add_argument("--guard_loss", type=str, default="ce_prob", choices=["ce_prob", "margin"],
+                        help="d3 guard loss: cross-entropy on [P(safe), P(unsafe)] (paper) or the logit margin unsafe - safe")
+    parser.add_argument("--guard_align", type=str, default="retok", choices=["retok", "ids"],
+                        help="guard input: the decoded suffix re-tokenised with the prompt (paper; the gradient rows are then "
+                             "taken from the last len(suffix) tokens) or the exact suffix ids at known positions "
+                             "(needs a target that shares d3's vocabulary, i.e. Qwen3.5)")
     parser.add_argument("--print-every", type=int, default=200)
     parser.add_argument("--pretrained_model", type=str, default="llama2")
     parser.add_argument("--pretrained_judge_model", type=str, default="Qwen2.5-7B-Instruct")
+    parser.add_argument("--response_device", type=str, default="cuda:2", help="device of the victim/response model (loaded lazily, on first guard pass)")
+    parser.add_argument("--judge_device", type=str, default="cuda:3", help="device of the LLM judge (loaded lazily, on first guard pass)")
     parser.add_argument("--pretrained_guard_model", type = str, default = "None")
+    parser.add_argument("--dataset", type=str, default="advbench_original",
+                        help="dataset_flag of attack_suffix.py (advbench_original, DNA_original, harmBench_original)")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--straight-through", action="store_true")
     parser.add_argument("--topk", type=int, default=0)
@@ -172,17 +184,14 @@ def main():
     device = "cuda:{}".format(generate_device_id) if torch.cuda.is_available() and not args.no_cuda else "cpu"
     guard_model_device = "cuda:{}".format(guard_device_id) if torch.cuda.is_available() and not args.no_cuda else "cpu"
     
-    model_path_dicts = {"Llama-2-7b-chat-hf": "/hub/huggingface/models/meta/llama2-hf/llama-2-7b-chat-hf",
-                        "Llama-3-8b" : "/hub/huggingface/models/meta/Llama-3-8B",
-                        "Llama-3-8b-instruct" : "/hub/huggingface/models/meta/Llama-3-8B-Instruct",
-                        "Vicuna-7b-v1.5": "lmsys/vicuna-7b-v1.5",
-                        "guanaco-7b": "TheBloke/guanaco-7B-HF",
-                        "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2", 
-                        "Llama-Guard-3-8B":"/hub/huggingface/models/meta/Llama-Guard-3-8B",
-                        "gemma2" : "/hub/huggingface/models/CLAS24/gemma-2-9b-it/",
+    # resolved through the HF cache (HF_HUB_CACHE)
+    model_path_dicts = {"Llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
+                        "Qwen2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+                        "Qwen3.5-4b": "Qwen/Qwen3.5-4B",
+                        "Qwen3.5-9b": "Qwen/Qwen3.5-9B",
                         }
     guard_model_path_dicts = {
-            "llama-guard-3-8b" : "/hub/huggingface/models/meta/Llama-Guard-3-8B",
+            "d3-flash" : "vllm-sr/d3-flash",
             }
     model_path = model_path_dicts[args.pretrained_model]
     if args.pretrained_guard_model in guard_model_path_dicts:
@@ -192,21 +201,38 @@ def main():
     if args.seed != -1:
         seed_everything(args.seed)
     # Load pretrained model
-    model, tokenizer = load_model_and_tokenizer(model_path,
-                                                low_cpu_mem_usage=True,
-                                                use_cache=False,
-                                                device=device)
+    if args.pretrained_model.startswith("Qwen3.5"):
+        # bf16-native hybrid (Gated DeltaNet + attention) model; its nested config does not take use_cache here
+        model, tokenizer = load_model_and_tokenizer(model_path,
+                                                    low_cpu_mem_usage=True,
+                                                    dtype=torch.bfloat16,
+                                                    device=device)
+    else:
+        model, tokenizer = load_model_and_tokenizer(model_path,
+                                                    low_cpu_mem_usage=True,
+                                                    use_cache=False,
+                                                    device=device)
     model.generation_config.pad_token_id = tokenizer.pad_token_id
-    
+
     if guard_model_path != "":
-        guard_model, guard_tokenizer, guard_model_embedding_weights = load_guard_model_and_tokenizer(guard_model_path, low_cpu_mem_usage = True, use_cache = False, device = guard_model_device)
+        from d3_guard import D3Guard
+        guard_model = D3Guard(guard_model_path, guard_model_device)
+        guard_tokenizer = tokenizer  # candidate prompts are tokenised with the target tokenizer
+        if guard_model.shares_vocab(tokenizer):
+            # same token ids as d3: one-hot @ d3's own embedding table, exact
+            guard_model_embedding_weights = guard_model.own_embeddings()
+        else:
+            guard_model_embedding_weights = guard_model.bridge_embeddings(
+                tokenizer, model.get_input_embeddings().weight.shape[0])
+        print("guard embeddings:", "d3 own table" if guard_model.shares_vocab(tokenizer) else "bridge",
+              tuple(guard_model_embedding_weights.shape))
     elif args.pretrained_guard_model != "None":
         guard_model = DNNClassifier()
-        guard_model.load_state_dict(torch.load(f"/data/home/Xinzhe/GuardBreaker/proxy_model/model/{args.pretrained_guard_model}.pth"))
+        guard_model.load_state_dict(torch.load(f"../proxy_model/model/{args.pretrained_guard_model}.pth"))
         guard_model.to(guard_device_id)
         guard_model.eval()
         guard_tokenizer = AutoTokenizer.from_pretrained(
-            "/hub/huggingface/models/meta/Llama-3-8B",
+            "meta-llama/Llama-3.1-8B-Instruct",
             trust_remote_code=True,
             use_fast=False,
             use_cache=True,

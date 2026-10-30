@@ -98,19 +98,17 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
     bad_words = ' '.join(bad_words)
 
     BIG_CONST = 1e10
+    # rows of the embedding table = logit dimension (Llama-3: 128256 vs tokenizer.vocab_size 128000, Qwen3.5: 248320 vs 248044)
+    vocab_dim = model.get_input_embeddings().weight.shape[0]
     if args.use_sysprompt:
         x_sys = sys_prompt + x
-        x_ = tokenizer.encode(x_sys)[1:]
+        x_ = encode_no_bos(tokenizer, x_sys)
     else:
-        x_ = tokenizer.encode(x)[1:]
+        x_ = encode_no_bos(tokenizer, x)
     x_t = torch.tensor(x_, device=device, dtype=torch.long)
     x_onehot = one_hot(
         x_t,
-        dimension=(
-            tokenizer.vocab_size
-            if "Llama-3-8b" not in args.pretrained_model
-            else 128256
-        ),
+        dimension=vocab_dim,
     )
 
     # repeat batch_size times
@@ -120,16 +118,12 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
     z_mask = None
     x_mask = None
     # extract keywords:
-    z_ = tokenizer.encode(z)[1:]  
+    z_ = encode_no_bos(tokenizer, z)
     z_t = torch.tensor(z_, device=device, dtype=torch.long)
 
     z_onehot = one_hot(
         z_t,
-        dimension=(
-            tokenizer.vocab_size
-            if "Llama-3-8b" not in args.pretrained_model
-            else 128256
-        ),
+        dimension=vocab_dim,
     )
     z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
 
@@ -159,12 +153,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
 
     z_mask = np.zeros(
         [
-            (
-                tokenizer.vocab_size
-                if "Llama-3-8b"
-                not in args.pretrained_model  #! 这里这样做是因为llama3的tokenizer明明应该是128K，但是实际上好像128256
-                else 128256
-            )
+            vocab_dim
         ]
     )
     z_mask[z_nonstop_] = 1.
@@ -179,7 +168,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
 
     x_words = tokenizer.encode(bad_words)
     x_mask = np.zeros(
-        [tokenizer.vocab_size if "Llama-3-8b" not in args.pretrained_model else 128256]
+        [vocab_dim]
     )
     x_mask[x_words] = 1.
     x_mask = torch.tensor(x_mask, device=device)
@@ -193,11 +182,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
 
     bad_words_onehot = one_hot(
         bad_words_t,
-        dimension=(
-            tokenizer.vocab_size
-            if "Llama-3-8b" not in args.pretrained_model
-            else 128256
-        ),
+        dimension=vocab_dim,
     )
     bad_words_onehot = bad_words_onehot.repeat(args.batch_size, 1, 1)
 
@@ -218,11 +203,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                         [
                             args.batch_size,
                             length - init_logits.shape[1],
-                            (
-                                tokenizer.vocab_size
-                                if "Llama-3-8b" not in args.pretrained_model
-                                else 128256
-                            ),
+                            vocab_dim,
                         ],
                         device=device,
                     ),
@@ -237,7 +218,8 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
             project='args.mode' + str(int(round(time.time() * 1000))),
             config=args)
 
-    y_logits = init_logits
+    # keep the optimised logits in fp32: Adam in fp16 underflows eps (1e-8 -> 0) and divides by zero (NaN)
+    y_logits = init_logits.float()
 
     epsilon = torch.nn.Parameter(torch.zeros_like(y_logits))
     if args.prefix_length > 0:
@@ -273,7 +255,10 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
     best_y_logits = None
 
     embedding_model = None
-    if guard_model_embedding_weights is None:
+    use_d3 = getattr(guard_model, "is_d3", False)
+    if args.guard_align == "ids" and not (use_d3 and guard_model.shares_vocab(tokenizer)):
+        raise ValueError("--guard_align ids needs d3 as guard and a target that shares its vocabulary (Qwen3.5)")
+    if guard_model_embedding_weights is None and not use_d3:
         embedding_model = AutoModelForCausalLM.from_pretrained("/hub/huggingface/models/meta/Llama-3-8B").to(guard_model_device)
         guard_model_embedding_weights = embedding_model.model.embed_tokens.weight
         peft_config = AdaLoraConfig(
@@ -303,11 +288,17 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
     iter_amount = 0
     paraphrase_amount = 0
     jailbreak_scores = []
+    guard_trace = []
     
     
     for iter in range(args.num_iters):
         iter_amount += 1
         optim.zero_grad()
+        if args.verbose and iter % 5 == 0 and torch.cuda.is_available():
+            mem = f"target {torch.cuda.memory_allocated(device) / 1e9:.1f} GB (peak {torch.cuda.max_memory_allocated(device) / 1e9:.1f})"
+            if guard_model is not None:
+                mem += f", guard {torch.cuda.memory_allocated(guard_model_device) / 1e9:.1f} GB (peak {torch.cuda.max_memory_allocated(guard_model_device) / 1e9:.1f})"
+            print(f"[mem] iter {iter}: {mem}")
 
         y_logits_ = y_logits + epsilon
         soft_forward_y = y_logits_ / 0.001
@@ -317,7 +308,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
             else:
                 soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / 0.001
         if args.fp16:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.autocast(device_type="cuda", dtype=model.dtype):
                 y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask, x_past=x_model_past, bad_mask=None) # without gradient
         else:
             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
@@ -333,7 +324,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
 
         soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
         if args.fp16:
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type='cuda', dtype=model.dtype):
                 xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
         else:
             xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
@@ -445,10 +436,29 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                 if args.guard:
                     score_optim = torch.optim.Adagrad([leaf_param], lr=args.stepsize)
                 
-                y_logits_modified = y_logits.to(guard_model_device) + leaf_param
+                y_logits_modified = move_to(y_logits, guard_model_device) + leaf_param
                 if args.guard:
                     y_logits_modified.requires_grad_()
-                
+
+                with torch.no_grad():
+                    # how saturated is the softmax the guard gradient is back-propagated through? A fresh Adagrad(eps=1e-10)
+                    # step only moves the entries whose gradient p * (g - <p, g>) is not ~0, i.e. whose probability is
+                    # not negligible: sm_active counts the entries with p > 1e-10
+                    sm_p = torch.softmax(y_logits_modified.float(), -1)
+                    sm_top2 = y_logits_modified.float().topk(2, dim=-1).values
+                    sm_gap = sm_top2[..., 0] - sm_top2[..., 1]
+                    sm_stats = {
+                        "sm_maxp_mean": sm_p.max(-1).values.mean().item(),
+                        "sm_maxp_min": sm_p.max(-1).values.min().item(),
+                        "sm_active": int((sm_p > 1e-10).sum()),
+                        "gap_mean": sm_gap.mean().item(),
+                        "gap_min": sm_gap.min().item(),
+                        "ylog_min": y_logits_modified.min().item(),
+                        "ylog_max": y_logits_modified.max().item(),
+                        "ylog_std": y_logits_modified.float().std().item(),
+                    }
+                    del sm_p
+
                 # print("leaf_param.is_leaf: ", leaf_param.is_leaf)
                 # print("leaf_param.requires_grad: ", leaf_param.requires_grad)
                 # print("leaf_param: ", leaf_param)
@@ -456,7 +466,7 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                 
                 # decode to get text
                 text, _, text_output_so_far = decode_with_model_topk(
-                    model, y_logits_modified.to(device), args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
+                    model, move_to(y_logits_modified, device), args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
                 
                 text_output_so_far = text_output_so_far.tolist()
 
@@ -465,8 +475,35 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
                     print(text_post[bi])
-                    input_ids = tokenizer(prompt, return_tensors="pt").to(guard_model_device)['input_ids']
-                    
+                    suffix_ids = text_output_so_far[bi]
+                    retok_equal = None
+                    if args.guard_align == "ids":
+                        # exact ids at known positions: x, the optimised suffix as decoded (no decode -> re-tokenise round
+                        # trip), then the ". " that get_text_from_logits appends to the text
+                        prefix_ids = tokenizer(x + " ")["input_ids"]
+                        tail_ids = tokenizer(". ")["input_ids"]
+                        sfx_start = len(prefix_ids)
+                        input_ids = torch.tensor([prefix_ids + suffix_ids + tail_ids], device=guard_model_device)
+                        retok_equal = tokenizer(prompt)["input_ids"] == input_ids[0].tolist()
+                    else:
+                        input_ids = tokenizer(prompt, return_tensors="pt").to(guard_model_device)['input_ids']
+                        if use_d3 and tokenizer.bos_token_id is not None and input_ids[0, 0].item() == tokenizer.bos_token_id:
+                            input_ids = input_ids[:, 1:]  # d3 prompts carry no BOS
+                        sfx_start = input_ids.shape[1] - len(suffix_ids)
+
+                    # where does the decoded suffix sit in the guard input? trailing = tokens after it; the retok guard
+                    # gradient below takes the *last* len(suffix) rows, so it is only aligned when trailing == 0.
+                    # align_frac = share of those rows whose token is the one y_logits decoded at that position
+                    prompt_ids = input_ids[0].tolist()
+                    trailing = None
+                    for st in range(len(prompt_ids) - len(suffix_ids), -1, -1):
+                        if prompt_ids[st:st + len(suffix_ids)] == suffix_ids:
+                            trailing = len(prompt_ids) - st - len(suffix_ids)
+                            break
+                    align_frac = sum(
+                        0 <= sfx_start + j < len(prompt_ids) and prompt_ids[sfx_start + j] == t for j, t in enumerate(suffix_ids)
+                    ) / len(suffix_ids)
+
                     # input_ids_mask 制作mask，用来遮掩 x + " " 这一部分的token。这样后面计算loss的时候，就不会考虑这部分的token
                     if args.guard:
                         input_ids_mask = torch.ones_like(input_ids)
@@ -495,13 +532,16 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                     # print("input_embeds.shape: ", input_embeds.shape)
                     if args.guard:
                         input_embeds.requires_grad_()
-                    template_embeds_1, template_embeds_2 = get_template_embeddings(guard_model_embedding_weights, device = guard_model_device)
-                    
-                    full_embeds = torch.cat([template_embeds_1, input_embeds, template_embeds_2], dim=1)
-
-                    full_embeds = full_embeds.to(guard_model_device)
-                    # print("full_embeds.shape: ", full_embeds.shape)
-                    if embedding_model is not None:
+                    guard_logits = None
+                    if use_d3:
+                        score_dist, guard_logits = guard_model.score_from_embeds(input_embeds, return_logits=True)
+                    else:
+                        template_embeds_1, template_embeds_2 = get_template_embeddings(guard_model_embedding_weights, device = guard_model_device)
+                        full_embeds = torch.cat([template_embeds_1, input_embeds, template_embeds_2], dim=1)
+                        full_embeds = full_embeds.to(guard_model_device)
+                    if use_d3:
+                        pass
+                    elif embedding_model is not None:
                         hidden_states = embedding_model(inputs_embeds=full_embeds, output_hidden_states=True).hidden_states
                         embedding = hidden_states[-1].mean(dim=1).squeeze()
                         outputs = F.sigmoid(guard_model(embedding))
@@ -526,7 +566,11 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                     score_dist = score_dist.to(guard_model_device)
                     score_label = torch.zeros(1, dtype=torch.long).to(guard_model_device) # 0 : safe
                     score_loss = torch.nn.CrossEntropyLoss()(score_dist.unsqueeze(0), score_label) # use CrossEntropyLoss to calculate the loss, we minimize the loss to maximize the score
+                    if guard_logits is not None and args.guard_loss == "margin":
+                        # unsafe - safe readout logit: keeps a gradient where the probabilities (and the CE) saturate
+                        score_loss = guard_logits[1] - guard_logits[0]
                     print("score_loss: ", score_loss.item(), "\tscore_dist: ", score_dist.data.cpu().tolist())
+                    grad_norm = step_l1 = step_max = step_nnz = None
                     if args.guard:
                         score_optim.zero_grad()
                         score_loss.backward(retain_graph = True)
@@ -538,37 +582,74 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
                         
                         # print("one_hot_.grad.shape: ", one_hot_.grad.shape)
                         
-                        # 增加掩码，遮掩掉 x + " " 这部分的token
-                        one_hot_grad = one_hot_grad * input_ids_mask
-                        
-                        # print("one_hot_grad: ", one_hot_grad)
-                        
-                        one_hot_grad = one_hot_grad[-len(text_output_so_far[bi]):, :]
+                        if args.guard_align == "ids":
+                            one_hot_grad = one_hot_grad[sfx_start:sfx_start + len(suffix_ids), :]
+                        else:
+                            # 增加掩码，遮掩掉 x + " " 这部分的token
+                            one_hot_grad = one_hot_grad * input_ids_mask
+
+                            # print("one_hot_grad: ", one_hot_grad)
+
+                            one_hot_grad = one_hot_grad[-len(text_output_so_far[bi]):, :]
+                        grad_norm = one_hot_grad.float().norm().item()
                         # print("After slicing, one_hot_grad: ", one_hot_grad)
                         # print("After slicing, one_hot_grad.shape: ", one_hot_grad.shape)
                         
-                        # dot_product = torch.sum(one_hot_grad * F.softmax(logits[:, template_embeds_1.shape[1] : template_embeds_1.shape[1] + input_embeds.shape[1], :], dim = -1), dim=-1)  # 与 loss_G 点乘
-                        dot_product = torch.sum(one_hot_grad * torch.softmax(y_logits_modified, -1), dim=-1)  # 与 loss_G 点乘
-                        
-                        # print("dot_product: ", dot_product)
-                        
-                        dot_product_sum = dot_product.sum()
-                        
-                        # print("dot_product_sum: ", dot_product_sum)
-                        
-                        dot_product_sum.backward()
-                        
-                        score_optim.step()
-                        
-                        # y_logits = torch.nn.Parameter(y_logits.data.detach())
-                        y_logits = y_logits.to(device) + leaf_param.to(device)
-                        
+                        if one_hot_grad.shape[0] != y_logits_modified.shape[1]:
+                            # the decoded suffix was re-tokenised to a different length, so its positions no longer
+                            # line up with y_logits: skip the guard step for this round
+                            print(f"guard step skipped: {one_hot_grad.shape[0]} guard tokens vs {y_logits_modified.shape[1]} suffix positions")
+                        else:
+                            # dot_product = torch.sum(one_hot_grad * F.softmax(logits[:, template_embeds_1.shape[1] : template_embeds_1.shape[1] + input_embeds.shape[1], :], dim = -1), dim=-1)  # 与 loss_G 点乘
+                            dot_product = torch.sum(one_hot_grad * torch.softmax(y_logits_modified, -1), dim=-1)  # 与 loss_G 点乘
+
+                            # print("dot_product: ", dot_product)
+
+                            dot_product_sum = dot_product.sum()
+
+                            # print("dot_product_sum: ", dot_product_sum)
+
+                            dot_product_sum.backward()
+
+                            score_optim.step()
+                            # what the single Adagrad step actually moved (leaf_param started at zero)
+                            step = leaf_param.detach().abs()
+                            step_l1, step_max, step_nnz = step.sum().item(), step.max().item(), int((step > 1e-2).sum())
+
+                            # y_logits = torch.nn.Parameter(y_logits.data.detach())
+                            y_logits = move_to(y_logits, device) + move_to(leaf_param, device)
+
                         # print("y_logits: ", y_logits)
                         # print("y_logits.grad: ", y_logits.grad)
                         # print("y_logits.requires_grad: ", y_logits.requires_grad)
                         
                         # y_logits.requires_grad = False
                 
+                aligned_trace = {}
+                if args.guard_align == "ids":
+                    # the id-aligned input above only provides the gradient; pass/fail and the best-prompt tracking use d3's
+                    # own score of the real prompt text, i.e. what the guard would actually see (as in the retok mode)
+                    aligned_trace = {
+                        "p_safe_aligned": score_dist.data.cpu().tolist()[0],
+                        "margin_aligned": None if guard_logits is None else (guard_logits[1] - guard_logits[0]).item(),
+                        "retok_equal": retok_equal,
+                    }
+                    score_dist, guard_logits = guard_model.score_text(prompt, return_logits=True)
+
+                guard_trace.append({
+                    "iter": iter + 1,
+                    "p_safe": score_dist.data.cpu().tolist()[0],
+                    "margin": None if guard_logits is None else (guard_logits[1] - guard_logits[0]).item(),
+                    "grad_norm": grad_norm,
+                    "step_l1": step_l1,
+                    "step_max": step_max,
+                    "step_nnz": step_nnz,
+                    "trailing": trailing,
+                    "align_frac": align_frac,
+                    **sm_stats,
+                    **aligned_trace,
+                })
+
                 # save best score
                 if best_score_dist is None or score_dist.data.cpu().tolist()[0] > best_score_dist[0]:
                     best_score_loss = score_loss.item()
@@ -628,12 +709,16 @@ def decode(model, tokenizer, device, dataset_flag, response_pipe, judge_pipe, ju
     evaluate_result['iter_amount'] = iter_amount
     evaluate_result['paraphrase_amount'] = paraphrase_amount
     evaluate_result['jailbreak_scores'] = jailbreak_scores
+    evaluate_result['guard_trace'] = guard_trace
+    evaluate_result['pretrained_model'] = args.pretrained_model
+    evaluate_result['guard_loss'] = args.guard_loss
+    evaluate_result['guard_align'] = args.guard_align
     if not os.path.exists("./outputs/GuardBreaker/suffix/attack_evaluate/"):
         os.makedirs("./outputs/GuardBreaker/suffix/attack_evaluate/")
     if not os.path.exists(f"./outputs/GuardBreaker/suffix/attack_evaluate/{args.pretrained_judge_model}/"):
         os.makedirs(f"./outputs/GuardBreaker/suffix/attack_evaluate/{args.pretrained_judge_model}/")
     
-    with open(f"./outputs/GuardBreaker/suffix/attack_evaluate/{args.pretrained_judge_model}/{dataset_flag}_cold_iter_{args.num_iters}_qeury_{args.optim_y_iters}_paraphrase_{args.paraphrase_iters}_v2.jsonl","a") as f:
+    with open(f"./outputs/GuardBreaker/suffix/attack_evaluate/{args.pretrained_judge_model}/{dataset_flag}_cold_iter_{args.num_iters}_qeury_{args.optim_y_iters}_paraphrase_{args.paraphrase_iters}_v2{args.run_tag}.jsonl","a") as f:
         f.write(json.dumps(evaluate_result, ensure_ascii=False) + "\n")
         
             

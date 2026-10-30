@@ -1,13 +1,21 @@
+# usage: bash guard_attack.sh <mode> <startIndex> <generate_device_id> <guard_device_id> [dataset] [extra args, e.g. --guard]
+# --paraphrase-iters is set huge by default: query re-paraphrasing needs an external LLM API (see evaluate_util.harmful_paraphrase)
+# run from the MTO/ directory with the project venv active; models are read from the HF cache.
+export HF_HUB_CACHE=${HF_HUB_CACHE:-/mnt/data1/huggingface/hub}
+export HF_HUB_OFFLINE=1
 mode=$1
 startIndex=$2
 generate_device_id=$3
 guard_device_id=$4
+dataset=${5:-advbench_original}
+shift $(( $# < 5 ? $# : 5 ))
 
 python cold_decoding.py  \
 	--seed 12 \
 	--mode $mode \
-	--pretrained_model Llama-3-8b-instruct \
-	--pretrained_guard_model llama-guard-3-8b \
+	--dataset $dataset \
+	--pretrained_model Llama-3.1-8b-instruct \
+	--pretrained_guard_model d3-flash \
 	--device-id $generate_device_id \
 	--guard-device-id $guard_device_id \
 	--init-temp 1 \
@@ -32,5 +40,6 @@ python cold_decoding.py  \
 	--stepsize-ratio 1  \
     --batch-size 1 \
     --print-every 1000 \
-	--fp16 
-	
+	--fp16 \
+	--paraphrase-iters 1000000 \
+	"$@"

@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import json
+import copy
 import os
 import nltk
 from nltk import tokenize
@@ -22,6 +23,33 @@ from tqdm import tqdm
 from difflib import SequenceMatcher
 
 from bleuloss import batch_log_bleulosscnn_ae
+
+
+def move_to(t, device):
+    """`t.to(device)`, but a transfer between two different GPUs is staged through host memory.
+
+    Direct GPU-to-GPU copies are unreliable on this machine: depending on the CUDA initialisation order and the allocator
+    they silently deliver zeros or stale memory (measured with randn tensors: 0->1 all-zero in 600/600 copies under
+    expandable_segments in one process, 1->0 returning unrelated data in another), which corrupted the logits handed to the
+    guard and the guard step written back. Host staging was exact in every trial and costs ~ms for [1, 20, V] logits.
+    """
+    device = torch.device(device)
+    if t.is_cuda and device.type == "cuda" and t.device != device:
+        return t.cpu().to(device)
+    return t.to(device)
+
+
+def _fresh(past):
+    """Copy of a prompt KV cache. Cache objects (transformers>=5) grow in place when reused, tuples did not."""
+    return copy.deepcopy(past) if past is not None else None
+
+
+def encode_no_bos(tokenizer, text):
+    """tokenizer.encode without the BOS token, for tokenizers that prepend one (Llama) and those that do not (Qwen)."""
+    ids = tokenizer.encode(text)
+    if tokenizer.bos_token_id is not None and ids and ids[0] == tokenizer.bos_token_id:
+        ids = ids[1:]
+    return ids
 
 
 def embed_inputs(embedding, logits, x_onehot=None, z_onehot=None, device=None):
@@ -135,7 +163,7 @@ def get_text_from_logits(logits, tokenizer):
     for i in range(logits.shape[1]):
         last = _greedy(logits[:, i, :])
         output_so_far = last if output_so_far is None else torch.cat((output_so_far, last), dim=1)
-        logp += logits[:, i, :].log_softmax(-1).data.cpu().numpy()[:, last.data.cpu().numpy()]
+        logp += logits[:, i, :].log_softmax(-1).float().data.cpu().numpy()[:, last.data.cpu().numpy()]
 
     nll = -logp
     batch_size = output_so_far.shape[0]
@@ -221,13 +249,14 @@ def initialize(model, x, length, temperature, batch_size, device, tokenizer):
     return logits_so_far
 
 
+@torch.no_grad()  # only the decoded text/ids are used: no graph through the (hybrid) cache
 def decode_with_model_topk(model, y_logits, topk, x_onehot, x_past, tokenizer, extra_mask=None, bad_mask=None):
     # y_logits : [bsz, length, vocab_size]
     # x_onehot : [bsz, 1     , vocab_size]
     # extra_mask:[bsz, length, vocab_size]
     assert x_onehot.shape[1] == 1, x_onehot.shape
     length = y_logits.shape[1]
-    past = x_past
+    past = _fresh(x_past)
     embeddings_weight =  model.get_input_embeddings().weight
     input_embeds = torch.matmul(x_onehot.float().to(embeddings_weight.dtype), embeddings_weight)
     mask_t_all = None
@@ -268,7 +297,7 @@ def soft_forward_loss(model, y_logits, topk, x_onehot, x_past, extra_mask=None, 
     )
     # print(x_past.shape)
     # embed_inputs: [bsz, length, embed_size]
-    xy_logits = model(past_key_values=x_past, inputs_embeds=xy_embeds).logits
+    xy_logits = model(past_key_values=_fresh(x_past), inputs_embeds=xy_embeds).logits
     x_length = x_onehot.shape[1]
     y_logits = xy_logits[:, x_length - 1:-1, :]
 
@@ -463,14 +492,16 @@ def soft_forward(model, x_onehot, y_logits, topk, extra_mask=None, x_past=None, 
     # print("x_onehot.shape: ", x_onehot.shape)
     # print("y_logits.shape: ", y_logits.shape)
     
-    xy_embeds = embed_inputs(
-        model.get_input_embeddings().weight,
-        y_logits,
-        x_onehot=x_onehot,
-        device=y_logits.device
-    )
-    # embed_inputs: [bsz, length, embed_size]
-    xy_logits = model(past_key_values=x_past, inputs_embeds=xy_embeds, use_cache=True).logits
+    # with detach the logits are returned without gradient: do not build (and keep alive) the autograd graph of the forward
+    with torch.set_grad_enabled(not detach and torch.is_grad_enabled()):
+        xy_embeds = embed_inputs(
+            model.get_input_embeddings().weight,
+            y_logits,
+            x_onehot=x_onehot,
+            device=y_logits.device
+        )
+        # embed_inputs: [bsz, length, embed_size]
+        xy_logits = model(past_key_values=_fresh(x_past), inputs_embeds=xy_embeds, use_cache=True).logits
     # print(xy_logits.shape)
     if x_onehot != None:
         x_length = x_onehot.shape[1]
@@ -483,7 +514,7 @@ def soft_forward(model, x_onehot, y_logits, topk, extra_mask=None, x_past=None, 
     else:
         return y_logits
     length = y_logits.shape[1]
-    past = x_past
+    past = _fresh(x_past)
     input_embeds = torch.matmul(x_onehot.float(), model.get_input_embeddings().weight)
     
 
@@ -531,7 +562,7 @@ def soft_forward_xyz(model, x_onehot, y_logits, z_onehot):
         z_onehot=z_onehot,
         device=y_logits.device
     )
-    xyz_logits = model(inputs_embeds=xyz_embeds).logits
+    xyz_logits = model(inputs_embeds=xyz_embeds, use_cache=False).logits
     if x_onehot is not None:
         xy_length = x_onehot.shape[1] + y_logits.shape[1]
     else:
@@ -768,7 +799,7 @@ def pre_filter(model, y_logits, topk, x_onehot, x_past, tokenizer, extra_mask=No
     # extra_mask:[bsz, length, vocab_size]
     assert x_onehot.shape[1] == 1, x_onehot.shape
     length = y_logits.shape[1]
-    past = x_past
+    past = _fresh(x_past)
     input_embeds = torch.matmul(x_onehot.float(), model.get_input_embeddings().weight)
     mask_t_all = None
     logits_so_far = None
@@ -1081,7 +1112,7 @@ def rank_generations(text_list, x, z, mode="abductive"):
 def vocab_prune(model, y_logits, topk, x_onehot, x_past, tokenizer, extra_mask=None):
     assert x_onehot.shape[1] == 1, x_onehot.shape
     length = y_logits.shape[1]
-    past = x_past
+    past = _fresh(x_past)
     input_embeds = torch.matmul(x_onehot.float(), model.get_input_embeddings().weight)
     mask_t_all = None
     logits_so_far = None
@@ -1137,7 +1168,7 @@ def forw(model, y_logits, topk, x_onehot, x_past):
     )
     # print(x_past.shape)
     # embed_inputs: [bsz, length, embed_size]
-    xy_logits = model(past_key_values=x_past, inputs_embeds=xy_embeds, use_cache=True).logits
+    xy_logits = model(past_key_values=_fresh(x_past), inputs_embeds=xy_embeds, use_cache=True).logits
     x_length = x_onehot.shape[1]
     logits_so_far = xy_logits[:, x_length - 1:-1, :]
 

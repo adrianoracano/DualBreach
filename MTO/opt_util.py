@@ -2,10 +2,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import AdaLoraConfig, TaskType, get_peft_model
 
-def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', **kwargs):
+def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', dtype=torch.float16, **kwargs):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
+        dtype=dtype,
         trust_remote_code=True,
         **kwargs
     ).to(device).eval()

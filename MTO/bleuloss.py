@@ -45,7 +45,7 @@ def batch_log_bleulosscnn_ae(decoder_outputs, target_idx, ngram_list, trans_len=
         if ngram > output_len:
             continue
         eye_filter = torch.eye(ngram).view([1, 1, ngram, ngram])
-        eye_filter = eye_filter.to(out.device)
+        eye_filter = eye_filter.to(device=out.device, dtype=out.dtype)
         term = nn.functional.conv2d(out, eye_filter)/ngram
         if ngram < decoder_outputs.size()[1]:
             term = term.squeeze(1)
